@@ -11,8 +11,11 @@ use generator::MarketGenerator;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let bind_addr = format!("0.0.0.0:{}", port);
+
     println!("🐂 Bull Tech — FPGA HFT Data Generator");
-    println!("   Starting server on http://0.0.0.0:8080");
+    println!("   Starting server on http://{}", bind_addr);
 
     // Initialize generators for each symbol
     let mut generators = HashMap::new();
@@ -66,7 +69,7 @@ async fn main() -> std::io::Result<()> {
             // WebSocket endpoint
             .route("/v1/feed", web::get().to(ws::feed))
     })
-    .bind("0.0.0.0:8080")?
+    .bind(&bind_addr)?
     .run()
     .await
 }

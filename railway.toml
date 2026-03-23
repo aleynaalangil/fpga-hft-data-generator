@@ -1,0 +1,5 @@
+[deploy]
+startCommand = "./target/release/fpga-hft-data-generator"
+
+[build]
+buildCommand = "cargo build --release"
