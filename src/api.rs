@@ -1,10 +1,11 @@
 use crate::generator::MarketGenerator;
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, web};
+use dashmap::DashMap;
+use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-type AppState = web::Data<Arc<Mutex<HashMap<String, MarketGenerator>>>>;
+type AppState = web::Data<Arc<DashMap<String, MarketGenerator>>>;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -32,25 +33,25 @@ pub async fn health() -> impl Responder {
 
 /// GET /api/v1/symbols
 pub async fn symbols(state: AppState) -> impl Responder {
-    let gens = state.lock().unwrap();
-    let symbols: Vec<String> = gens.keys().cloned().collect();
+    let symbols: Vec<String> = state.iter().map(|r| r.key().clone()).collect();
     HttpResponse::Ok().json(SymbolsResponse { symbols })
 }
 
 /// GET /api/v1/tick/{symbol}
 /// Symbol path uses dash separator, e.g. SOL-USDC → SOL/USDC
 pub async fn tick(state: AppState, path: web::Path<String>) -> impl Responder {
-    let raw_symbol = path.into_inner();
-    let symbol = raw_symbol.replace('-', "/");
+    let symbol = raw_symbol_to_symbol(path.into_inner());
 
-    let gens = state.lock().unwrap();
-    match gens.get(&symbol) {
-        Some(generator) => match generator.latest_tick() {
-            Some(tick) => HttpResponse::Ok().json(tick),
-            None => HttpResponse::ServiceUnavailable().json(ErrorResponse {
-                error: format!("No ticks generated yet for {}", symbol),
-            }),
-        },
+    match state.get(&symbol) {
+        Some(item) => {
+            let generator = item.value();
+            match generator.latest_tick() {
+                Some(tick) => HttpResponse::Ok().json(tick),
+                None => HttpResponse::ServiceUnavailable().json(ErrorResponse {
+                    error: format!("No ticks generated yet for {}", symbol),
+                }),
+            }
+        }
         None => HttpResponse::NotFound().json(ErrorResponse {
             error: format!("Symbol '{}' not found", symbol),
         }),
@@ -59,12 +60,10 @@ pub async fn tick(state: AppState, path: web::Path<String>) -> impl Responder {
 
 /// GET /api/v1/bbo/{symbol}
 pub async fn bbo(state: AppState, path: web::Path<String>) -> impl Responder {
-    let raw_symbol = path.into_inner();
-    let symbol = raw_symbol.replace('-', "/");
+    let symbol = raw_symbol_to_symbol(path.into_inner());
 
-    let gens = state.lock().unwrap();
-    match gens.get(&symbol) {
-        Some(generator) => HttpResponse::Ok().json(generator.current_bbo()),
+    match state.get(&symbol) {
+        Some(item) => HttpResponse::Ok().json(item.value().current_bbo()),
         None => HttpResponse::NotFound().json(ErrorResponse {
             error: format!("Symbol '{}' not found", symbol),
         }),
@@ -80,20 +79,44 @@ pub struct OhlcvQuery {
 pub async fn ohlcv(
     state: AppState,
     path: web::Path<String>,
+    client: web::Data<clickhouse::Client>,
     query: web::Query<OhlcvQuery>,
 ) -> impl Responder {
-    let raw_symbol = path.into_inner();
-    let symbol = raw_symbol.replace('-', "/");
-    let minutes = query.minutes.unwrap_or(60);
+    let symbol = raw_symbol_to_symbol(path.into_inner());
+    let minutes = query.minutes.unwrap_or(60).clamp(1, 10_080);
 
-    let gens = state.lock().unwrap();
-    match gens.get(&symbol) {
-        Some(generator) => {
-            let candles = generator.build_ohlcv(minutes);
-            HttpResponse::Ok().json(candles)
-        }
-        None => HttpResponse::NotFound().json(ErrorResponse {
-            error: format!("Symbol '{}' not found", symbol),
-        }),
+    let candles = crate::db::get_historical_ohlc(&client, &symbol, minutes).await;
+
+    if candles.is_empty() {
+        return match state.get(&symbol) {
+            Some(item) => {
+                let candles = item.value().build_ohlcv(minutes);
+                HttpResponse::Ok().json(candles)
+            }
+            None => HttpResponse::NotFound().json(ErrorResponse {
+                error: format!("Symbol '{}' not found", symbol),
+            }),
+        };
     }
+
+    HttpResponse::Ok().json(candles)
+}
+
+pub async fn prometheus_metrics() -> impl Responder {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    let metric_families = crate::db::REGISTRY.gather();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        return HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("Failed to encode metrics: {}", e),
+        });
+    }
+
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(buffer)
+}
+
+fn raw_symbol_to_symbol(raw_symbol: String) -> String {
+    raw_symbol.replace('-', "/")
 }
