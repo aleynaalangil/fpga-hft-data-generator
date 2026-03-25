@@ -17,6 +17,8 @@ pub struct MarketGenerator {
     pub change_1h: Option<f64>,
     pub change_24h: Option<f64>,
     last_candle_minute: Option<String>,
+    current_candle: Option<OhlcvBar>,
+    prev_candle: Option<OhlcvBar>,
     tick_history: VecDeque<MarketTick>,
     max_history: usize,
 }
@@ -32,8 +34,10 @@ impl MarketGenerator {
             change_1h: None,
             change_24h: None,
             last_candle_minute: None,
-            tick_history: VecDeque::with_capacity(10_000),
-            max_history: 10_000,
+            current_candle: None,
+            prev_candle: None,
+            tick_history: VecDeque::new(),
+            max_history: 1_200,
         }
     }
 
@@ -77,6 +81,7 @@ impl MarketGenerator {
             self.tick_history.pop_front();
         }
         self.tick_history.push_back(tick.clone());
+        self.update_current_candle(&tick);
 
         tick
     }
@@ -133,50 +138,59 @@ impl MarketGenerator {
             return vec![];
         }
 
-        // Group ticks by minute bucket
-        let mut buckets: std::collections::BTreeMap<String, Vec<&MarketTick>> =
-            std::collections::BTreeMap::new();
+        let mut candles: Vec<OhlcvBar> = Vec::new();
+        let mut current: Option<OhlcvBar> = None;
 
         for tick in &self.tick_history {
-            // Truncate timestamp to start of minute
             let candle_time = if tick.timestamp.len() >= 16 {
                 format!("{}:00.000000Z", &tick.timestamp[..16])
             } else {
-                tick.timestamp.clone()
+                tick.timestamp[..tick.timestamp.len()].to_string()
             };
-            buckets.entry(candle_time).or_default().push(tick);
+
+            match &mut current {
+                Some(bar) if bar.candle_time == candle_time => {
+                    // Same minute — just update running OHLCV, zero allocations
+                    if tick.price > bar.high {
+                        bar.high = tick.price;
+                    }
+                    if tick.price < bar.low {
+                        bar.low = tick.price;
+                    }
+                    bar.close = tick.price;
+                    bar.volume += tick.amount;
+                }
+                _ => {
+                    // Minute boundary — push completed bar, open new one
+                    if let Some(completed) = current.take() {
+                        candles.push(completed);
+                    }
+                    current = Some(OhlcvBar {
+                        symbol: self.symbol.clone(),
+                        candle_time,
+                        open: tick.price,
+                        high: tick.price,
+                        low: tick.price,
+                        close: tick.price,
+                        volume: tick.amount,
+                    });
+                }
+            }
         }
 
-        let mut candles: Vec<OhlcvBar> = buckets
-            .into_iter()
-            .filter_map(|(candle_time, ticks)| {
-                let open = ticks.first()?.price;
-                let close = ticks.last()?.price;
-                let high = ticks.iter().map(|t| t.price).max().unwrap_or(open);
-                let low = ticks.iter().map(|t| t.price).min().unwrap_or(open);
-                let volume: Decimal = ticks.iter().map(|t| t.amount).sum();
-
-                Some(OhlcvBar {
-                    symbol: self.symbol.clone(),
-                    candle_time,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                })
-            })
-            .collect();
+        // Don't forget the last in-progress candle
+        if let Some(last) = current {
+            candles.push(last);
+        }
 
         // Return only the last N minutes
         let len = candles.len();
         if len > minutes {
-            candles = candles.split_off(len - minutes);
+            candles.drain(..len - minutes); // drain is cheaper than split_off
         }
 
         candles
     }
-
     /// Get the current price as f64 (for WebSocket messages).
     pub fn current_price(&self) -> f64 {
         self.current_price
@@ -200,7 +214,7 @@ impl MarketGenerator {
             error_rate: rng.gen_range(0.0001..0.001),
         };
 
-        let ohlc = self.build_ohlcv(1).first().cloned();
+        let ohlc = self.current_candle.clone();
 
         MarketDataMessage {
             price: self.current_price,
@@ -225,13 +239,8 @@ impl MarketGenerator {
 
         if let Some(last_min) = &self.last_candle_minute {
             if last_min != current_min {
-                // Minute has changed! The previous candle is now closed.
-                // We calculate all candles and find the one for `last_min`.
-                let bars = self.build_ohlcv(5);
-                let closed_bar = bars
-                    .iter()
-                    .find(|b| b.candle_time.starts_with(last_min))
-                    .cloned();
+                // Minute has changed! prev_candle holds the just-completed bar.
+                let closed_bar = self.prev_candle.clone();
                 self.last_candle_minute = Some(current_min.to_string());
                 return closed_bar;
             }
@@ -240,5 +249,36 @@ impl MarketGenerator {
         }
 
         None
+    }
+
+    fn update_current_candle(&mut self, tick: &MarketTick) {
+        let tick_min = &tick.timestamp[..16.min(tick.timestamp.len())];
+        let new_bar = || OhlcvBar {
+            symbol: self.symbol.clone(),
+            candle_time: tick_min.to_string() + ":00.000000Z",
+            open: tick.price,
+            high: tick.price,
+            low: tick.price,
+            close: tick.price,
+            volume: tick.amount,
+        };
+
+        match &mut self.current_candle {
+            Some(bar) if bar.candle_time.starts_with(tick_min) => {
+                if tick.price > bar.high {
+                    bar.high = tick.price;
+                }
+                if tick.price < bar.low {
+                    bar.low = tick.price;
+                }
+                bar.close = tick.price;
+                bar.volume += tick.amount;
+            }
+            _ => {
+                // Minute rolled over — save completed candle, open new one
+                self.prev_candle = self.current_candle.take();
+                self.current_candle = Some(new_bar());
+            }
+        }
     }
 }

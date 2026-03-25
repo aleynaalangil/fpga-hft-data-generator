@@ -45,7 +45,7 @@ async fn main() -> std::io::Result<()> {
     );
 
     // Setup DB Inserter Channels (buffered)
-    let (db_tx, db_rx) = tokio::sync::mpsc::channel::<db::InserterPayload>(100_000);
+    let (db_tx, db_rx) = tokio::sync::mpsc::channel::<db::InserterPayload>(1_000);
     let inserter_client = ch_client.clone();
     let inserter_handle = tokio::spawn(async move {
         db::run_unified_lazy_inserter(db_rx, inserter_client).await;
@@ -56,7 +56,7 @@ async fn main() -> std::io::Result<()> {
     let token = CancellationToken::new();
     let tick_token = token.clone();
 
-    let (tx, _rx) = broadcast::channel::<String>(1024);
+    let (tx, _rx) = broadcast::channel::<String>(128);
 
     // Spawn background tick generation task
     let bg_state = state.clone();
@@ -179,6 +179,7 @@ async fn main() -> std::io::Result<()> {
             // WebSocket endpoint
             .route("/v1/feed", web::get().to(ws::feed))
     })
+    .workers(2)
     .bind(&bind_addr)?
     .run();
 

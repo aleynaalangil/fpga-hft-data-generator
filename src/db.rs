@@ -1,9 +1,9 @@
 use crate::models::{MarketTick, OhlcvBar};
 use clickhouse::Client;
 use lazy_static::lazy_static;
-use prometheus::{GaugeVec, IntCounter, Registry, opts};
-use rust_decimal::Decimal;
+use prometheus::{opts, GaugeVec, IntCounter, Registry};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
@@ -198,37 +198,37 @@ pub async fn run_unified_lazy_inserter(mut rx: Receiver<InserterPayload>, client
         match payload {
             InserterPayload::Trade(t) => {
                 trade_buffer.push(t);
-                if trade_buffer.len() >= 1000 {
-                    if let Err(e) = flush_trades(&client, &mut trade_buffer).await {
-                        error!("❌ Failed to flush trades: {}", e);
-                    }
+                if trade_buffer.len() >= 1000
+                    && let Err(e) = flush_trades(&client, &mut trade_buffer).await
+                {
+                    error!("❌ Failed to flush trades: {}", e);
                 }
             }
             InserterPayload::Ohlcv(o) => ohlcv_buffer.push(o),
             InserterPayload::Flush => {
-                if !trade_buffer.is_empty() {
-                    if let Err(e) = flush_trades(&client, &mut trade_buffer).await {
-                        error!("❌ Failed to flush trades on interval: {}", e);
-                    }
+                if !trade_buffer.is_empty()
+                    && let Err(e) = flush_trades(&client, &mut trade_buffer).await
+                {
+                    error!("❌ Failed to flush trades on interval: {}", e);
                 }
-                if !ohlcv_buffer.is_empty() {
-                    if let Err(e) = flush_ohlcv(&client, &mut ohlcv_buffer).await {
-                        error!("❌ Failed to flush OHLCV on interval: {}", e);
-                    }
+                if !ohlcv_buffer.is_empty()
+                    && let Err(e) = flush_ohlcv(&client, &mut ohlcv_buffer).await
+                {
+                    error!("❌ Failed to flush OHLCV on interval: {}", e);
                 }
             }
         }
     }
     info!("🧹 Shutdown signal received. Finalizing ClickHouse flush...");
-    if !trade_buffer.is_empty() {
-        if let Err(e) = flush_trades(&client, &mut trade_buffer).await {
-            error!("❌ Failed to flush trades on shutdown: {}", e);
-        }
+    if !trade_buffer.is_empty()
+        && let Err(e) = flush_trades(&client, &mut trade_buffer).await
+    {
+        error!("❌ Failed to flush trades on shutdown: {}", e);
     }
-    if !ohlcv_buffer.is_empty() {
-        if let Err(e) = flush_ohlcv(&client, &mut ohlcv_buffer).await {
-            error!("❌ Failed to flush OHLCV on shutdown: {}", e);
-        }
+    if !ohlcv_buffer.is_empty()
+        && let Err(e) = flush_ohlcv(&client, &mut ohlcv_buffer).await
+    {
+        error!("❌ Failed to flush OHLCV on shutdown: {}", e);
     }
     info!("✅ All data flushed. Safe to exit.");
 }
@@ -296,7 +296,12 @@ pub async fn get_historical_ohlc(client: &Client, symbol: &str, minutes: usize) 
         minutes
     );
 
-    match client.query(&query).bind(symbol).fetch_all::<OhlcvRow>().await {
+    match client
+        .query(&query)
+        .bind(symbol)
+        .fetch_all::<OhlcvRow>()
+        .await
+    {
         Ok(rows) => rows.into_iter().map(|r| r.into()).collect(),
         Err(e) => {
             error!("❌ ClickHouse OHLC fetch failed: {}", e);
@@ -306,14 +311,12 @@ pub async fn get_historical_ohlc(client: &Client, symbol: &str, minutes: usize) 
 }
 
 pub async fn create_clickhouse_client() -> Client {
-    let url = std::env::var("CLICKHOUSE_URL")
-        .unwrap_or_else(|_| "http://localhost:8123".to_string());
-    let user = std::env::var("CLICKHOUSE_USER")
-        .unwrap_or_else(|_| "inserter_user".to_string());
-    let password = std::env::var("CLICKHOUSE_PASSWORD")
-        .unwrap_or_else(|_| "inserter_pass".to_string());
-    let database = std::env::var("CLICKHOUSE_DB")
-        .unwrap_or_else(|_| "hft_dashboard".to_string());
+    let url =
+        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+    let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "inserter_user".to_string());
+    let password =
+        std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "inserter_pass".to_string());
+    let database = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "hft_dashboard".to_string());
 
     Client::default()
         .with_url(url)
