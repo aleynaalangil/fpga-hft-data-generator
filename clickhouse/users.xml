@@ -1,0 +1,14 @@
+<clickhouse>
+    <profiles>
+        <default>
+            <!-- Per-query memory cap: 300 MB -->
+            <max_memory_usage>314572800</max_memory_usage>
+
+            <!-- Spill GROUP BY to disk before hitting memory limit -->
+            <max_bytes_before_external_group_by>104857600</max_bytes_before_external_group_by>
+
+            <!-- Spill ORDER BY to disk before hitting memory limit -->
+            <max_bytes_before_external_sort>104857600</max_bytes_before_external_sort>
+        </default>
+    </profiles>
+</clickhouse>

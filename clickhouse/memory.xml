@@ -1,0 +1,17 @@
+<clickhouse>
+    <!-- Cap total server RSS to 75% of available RAM -->
+    <max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Disable the uncompressed block cache — biggest idle memory saving -->
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+
+    <!-- Shrink the mark cache from the default 5 GB to 100 MB -->
+    <mark_cache_size>104857600</mark_cache_size>
+
+    <!-- Only 1 background merge thread — free tier has 1-2 vCPUs -->
+    <background_pool_size>1</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
+
+    <!-- Cap concurrent queries — prevents memory spikes from parallel requests -->
+    <max_concurrent_queries>10</max_concurrent_queries>
+</clickhouse>

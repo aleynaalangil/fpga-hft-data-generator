@@ -32,6 +32,7 @@ async fn main() -> std::io::Result<()> {
     info!("   Starting server on http://{}", bind_addr);
 
     let ch_client = create_clickhouse_client().await;
+    db::backfill_missing_candles(&ch_client).await;
 
     // Initialize generators for each symbol
     let generators = DashMap::new();

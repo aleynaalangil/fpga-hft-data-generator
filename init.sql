@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS hft_dashboard.historical_trades
 ENGINE = MergeTree()
 ORDER BY (symbol, timestamp)
 PARTITION BY toYYYYMM(timestamp)
-TTL timestamp + INTERVAL 7 DAY;
+TTL timestamp + INTERVAL 2 HOUR DELETE;
 
 CREATE TABLE IF NOT EXISTS hft_dashboard.market_ohlc
 (
@@ -28,4 +28,4 @@ CREATE TABLE IF NOT EXISTS hft_dashboard.market_ohlc
 ENGINE = ReplacingMergeTree()
 ORDER BY (symbol, candle_time)
 PARTITION BY toYYYYMM(candle_time)
-TTL candle_time + INTERVAL 30 DAY;
+TTL toDateTime(candle_time) + INTERVAL 90 DAY DELETE;

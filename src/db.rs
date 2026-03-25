@@ -289,24 +289,71 @@ pub async fn poll_1h_change(client: &Client, symbol: &str) -> Option<f64> {
 }
 
 pub async fn get_historical_ohlc(client: &Client, symbol: &str, minutes: usize) -> Vec<OhlcvBar> {
-    let query = format!(
-        "SELECT symbol, candle_time, open, high, low, close, volume FROM hft_dashboard.market_ohlc \
-         WHERE symbol = ? AND candle_time >= (now() - interval {} minute) \
+    // Try market_ohlc first (fast, pre-aggregated)
+    let ohlc_query = format!(
+        "SELECT symbol, candle_time, open, high, low, close, volume
+         FROM hft_dashboard.market_ohlc
+         WHERE symbol = ? AND candle_time >= (now() - interval {} minute)
          ORDER BY candle_time ASC",
         minutes
     );
 
-    match client
-        .query(&query)
-        .bind(symbol)
-        .fetch_all::<OhlcvRow>()
-        .await
-    {
+    let rows = client.query(&ohlc_query).bind(symbol).fetch_all::<OhlcvRow>().await;
+
+    if let Ok(rows) = rows {
+        if !rows.is_empty() {
+            return rows.into_iter().map(|r| r.into()).collect();
+        }
+    }
+
+    // Fallback: aggregate directly from raw trades (slower but always has data)
+    let trades_query = format!(
+        "SELECT
+            symbol,
+            toStartOfMinute(timestamp) AS candle_time,
+            argMin(price, timestamp) AS open,
+            max(price)               AS high,
+            min(price)               AS low,
+            argMax(price, timestamp) AS close,
+            sum(amount)              AS volume
+         FROM hft_dashboard.historical_trades
+         WHERE symbol = ? AND timestamp >= (now() - interval {} minute)
+         GROUP BY symbol, candle_time
+         ORDER BY candle_time ASC",
+        minutes
+    );
+
+    match client.query(&trades_query).bind(symbol).fetch_all::<OhlcvRow>().await {
         Ok(rows) => rows.into_iter().map(|r| r.into()).collect(),
         Err(e) => {
-            error!("❌ ClickHouse OHLC fetch failed: {}", e);
+            error!("❌ ClickHouse trades aggregation failed: {}", e);
             vec![]
         }
+    }
+}
+pub async fn backfill_missing_candles(client: &Client) {
+    let query =
+        "INSERT INTO hft_dashboard.market_ohlc
+         SELECT
+             symbol,
+             toStartOfMinute(timestamp) AS candle_time,
+             argMin(price, timestamp)   AS open,
+             max(price)                 AS high,
+             min(price)                 AS low,
+             argMax(price, timestamp)   AS close,
+             sum(amount)                AS volume
+         FROM hft_dashboard.historical_trades
+         WHERE timestamp >= now() - INTERVAL 2 HOUR
+           AND toStartOfMinute(timestamp) NOT IN (
+               SELECT candle_time FROM hft_dashboard.market_ohlc
+               WHERE candle_time >= now() - INTERVAL 2 HOUR
+           )
+         GROUP BY symbol, candle_time";
+
+    if let Err(e) = client.query(query).execute().await {
+        error!("❌ Backfill failed: {}", e);
+    } else {
+        info!("✅ Candle backfill complete.");
     }
 }
 
