@@ -71,7 +71,7 @@ impl MarketGenerator {
             amount: Decimal::from_f64(amount)
                 .unwrap_or(Decimal::ZERO)
                 .round_dp(8),
-            timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             order_id: Uuid::new_v4().to_string(),
             trader_id: rng.gen_range(1..=9999),
         };
@@ -128,7 +128,7 @@ impl MarketGenerator {
             spread: to_fixed_point(self.spread),
             bids,
             asks,
-            timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         }
     }
 
