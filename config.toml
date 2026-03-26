@@ -1,0 +1,51 @@
+# FPGA HFT Data Generator — configuration
+# All values shown are the defaults. Remove or comment out any section
+# to keep the default. The PORT environment variable overrides `port`.
+
+# HTTP server port
+port = 8080
+
+# Tick generation interval (milliseconds). 10ms = 100 ticks/sec.
+tick_interval_ms = 10
+
+# How often the ClickHouse inserter flushes on a timer (seconds).
+db_flush_interval_secs = 1
+
+# Maximum trades buffered in memory before a forced flush.
+db_insert_buffer_size = 1000
+
+# Ring-buffer depth per symbol (raw tick history kept in memory).
+tick_history_size = 1200
+
+# Broadcast channel capacity for WebSocket fan-out.
+ws_broadcast_capacity = 128
+
+# How often to query ClickHouse for 1h/24h price change (seconds).
+change_poll_interval_secs = 5
+
+# Seconds since last Pong before a WebSocket client is forcibly closed.
+ws_heartbeat_timeout_secs = 60
+
+# Seconds between Ping frames sent to WebSocket clients.
+ws_ping_interval_secs = 20
+
+# REST API rate limit: sustained requests per second per source IP.
+rate_limit_per_second = 100
+
+# REST API rate limit: burst allowance above the sustained rate.
+rate_limit_burst = 50
+
+# Trading pairs to simulate. Add or remove [[symbols]] blocks freely.
+[[symbols]]
+name          = "SOL/USDC"
+initial_price = 150.0
+drift         = 0.0001   # GBM drift μ — slight directional bias
+volatility    = 0.002    # GBM volatility σ — step size variance
+spread        = 0.01     # bid/ask spread width
+
+[[symbols]]
+name          = "BTC/USDC"
+initial_price = 65000.0
+drift         = 0.0001
+volatility    = 0.001
+spread        = 10.0

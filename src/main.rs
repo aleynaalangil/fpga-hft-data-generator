@@ -1,15 +1,19 @@
 pub mod api;
+pub mod config;
 pub mod db;
 pub mod generator;
 pub mod models;
 pub mod ws;
 
+use crate::config::AppConfig;
 use crate::db::{OhlcvRow, TradeRow, create_clickhouse_client};
 use actix_cors::Cors;
+use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, HttpServer, web};
 use dashmap::DashMap;
 use generator::MarketGenerator;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::join;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -19,37 +23,46 @@ use tracing_subscriber::EnvFilter;
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
-        // This looks for RUST_LOG, but defaults to 'info' if not found
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    db::register_metrics();
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let bind_addr = format!("0.0.0.0:{}", port);
 
-    info!("🐂 Bull Tech — FPGA HFT Data Generator");
+    db::register_metrics();
+
+    let cfg = AppConfig::load();
+    let bind_addr = format!("0.0.0.0:{}", cfg.port);
+
+    info!("Bull Tech — FPGA HFT Data Generator");
     info!("   Starting server on http://{}", bind_addr);
 
     let ch_client = create_clickhouse_client().await;
     db::backfill_missing_candles(&ch_client).await;
 
-    // Initialize generators for each symbol
-    let generators = DashMap::new();
-    generators.insert(
-        "SOL/USDC".to_string(),
-        MarketGenerator::new("SOL/USDC", 150.0, 0.0001, 0.002, 0.01),
-    );
-    generators.insert(
-        "BTC/USDC".to_string(),
-        MarketGenerator::new("BTC/USDC", 65_000.0, 0.0001, 0.001, 10.0),
-    );
+    // Initialize one generator per configured symbol
+    let generators: DashMap<String, MarketGenerator> = DashMap::new();
+    for sym in &cfg.symbols {
+        generators.insert(
+            sym.name.clone(),
+            MarketGenerator::new(
+                &sym.name,
+                sym.initial_price,
+                sym.drift,
+                sym.volatility,
+                sym.spread,
+                cfg.tick_history_size,
+            ),
+        );
+    }
 
-    // Setup DB Inserter Channels (buffered)
-    let (db_tx, db_rx) = tokio::sync::mpsc::channel::<db::InserterPayload>(1_000);
+    // DB inserter channel
+    let (db_tx, db_rx) =
+        tokio::sync::mpsc::channel::<db::InserterPayload>(cfg.db_insert_buffer_size);
     let inserter_client = ch_client.clone();
+    let flush_secs = cfg.db_flush_interval_secs;
+    let buf_size = cfg.db_insert_buffer_size;
     let inserter_handle = tokio::spawn(async move {
-        db::run_unified_lazy_inserter(db_rx, inserter_client).await;
+        db::run_unified_lazy_inserter(db_rx, inserter_client, flush_secs, buf_size).await;
     });
 
     let state = web::Data::new(Arc::new(generators));
@@ -57,9 +70,8 @@ async fn main() -> std::io::Result<()> {
     let token = CancellationToken::new();
     let tick_token = token.clone();
 
-    let (tx, _rx) = broadcast::channel::<String>(128);
+    let (tx, _rx) = broadcast::channel::<String>(cfg.ws_broadcast_capacity);
 
-    // Spawn background tick generation task
     let bg_state = state.clone();
     let bg_broadcast_tx = tx.clone();
     let broadcast_tx = web::Data::new(tx.clone());
@@ -68,34 +80,45 @@ async fn main() -> std::io::Result<()> {
     let shutdown_tx = db_tx.clone();
     let shutdown_token = token.clone();
 
+    let tick_interval_ms = cfg.tick_interval_ms;
+    let nominal_tps = (1000.0 / tick_interval_ms as f64) as u32;
+
+    // Spawn background tick generation task
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_millis(tick_interval_ms));
         loop {
             tokio::select! {
-                _ = tick_token.cancelled()=> {
-                    info!("📉 Tick generation task received shutdown signal.");
+                _ = tick_token.cancelled() => {
+                    info!("Tick generation task received shutdown signal.");
                     break;
                 }
-                _ = interval.tick()=> {
+                _ = interval.tick() => {
                     db::TICK_COUNTER.inc();
-                    //For my current setup with 2–10 symbols, a single loop is actually faster due to lower context-switching overhead. However, if I was planning to scale, these actions were needed to be taken:
-                    // Current (Single Loop): Best for < 50 symbols. It keeps all "ticks" perfectly synchronized in time.
-                    // Future (Multi-Spawn): If I scale to 500+ symbols, I should tokio::spawn a separate task for each MarketGenerator. This allows the OS to spread the load across all CPU cores.
-                    // !!!: If I do this, I'll need to move the broadcast::Sender into each task so they can all broadcast their own JSON independently.
+
                     for mut item in bg_state.iter_mut() {
-                        let generator = item.value_mut(); // This gives you &mut MarketGenerator
+                        let tick_start = Instant::now();
+
+                        let generator = item.value_mut();
                         let tick = generator.advance();
 
-                        db::PRICE_GAUGE.with_label_values(&[&generator.symbol]).set(generator.current_price());
+                        let tick_latency_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+                        db::TICK_LATENCY_HISTOGRAM.observe(tick_latency_ms);
+
+                        db::PRICE_GAUGE
+                            .with_label_values(&[&generator.symbol])
+                            .set(generator.current_price());
 
                         let _ = bg_db_tx.try_send(db::InserterPayload::Trade(TradeRow::from(&tick)));
 
-                        let ws_msg = generator.to_ws_message();
+                        let ws_msg = generator.to_ws_message(tick_latency_ms, nominal_tps);
                         if let Ok(json) = serde_json::to_string(&ws_msg) {
                             let _ = bg_broadcast_tx.send(json);
                         }
+
                         if let Some(bar) = generator.check_candle_closure() {
-                            let _ = bg_db_tx.try_send(db::InserterPayload::Ohlcv(OhlcvRow::from(&bar)));
+                            let _ = bg_db_tx
+                                .try_send(db::InserterPayload::Ohlcv(OhlcvRow::from(&bar)));
                         }
                     }
                 }
@@ -107,41 +130,39 @@ async fn main() -> std::io::Result<()> {
     let poll_state = state.clone();
     let poller_client = ch_client.clone();
     let poll_token = token.clone();
+    let poll_interval_secs = cfg.change_poll_interval_secs;
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(poll_interval_secs));
         loop {
             tokio::select! {
-                _= poll_token.cancelled() =>{
-                    info!("📉 24h Poller task shutting down.");
+                _ = poll_token.cancelled() => {
+                    info!("24h Poller task shutting down.");
                     break;
                 }
                 _ = interval.tick() => {
-                    let symbols: Vec<String> = poll_state.iter().map(|r| r.key().clone()).collect();
+                    let symbols: Vec<String> =
+                        poll_state.iter().map(|r| r.key().clone()).collect();
 
                     for symbol in symbols {
-                        // 1. Run both database queries concurrently
-                        // This returns a tuple of the results once BOTH are finished.
                         let (price_1h, price_24h) = join!(
-                        db::poll_1h_change(&poller_client, &symbol),
-                        db::poll_24h_change(&poller_client, &symbol)
+                            db::poll_1h_change(&poller_client, &symbol),
+                            db::poll_24h_change(&poller_client, &symbol)
                         );
 
-                        // 2. Lock the state once to apply any results we got
-                        if (price_1h.is_some() || price_24h.is_some())
-                            && let Some(mut item) = poll_state.get_mut(&symbol)
-                        {
-                            let generator = item.value_mut();
-                            let current = generator.current_price();
+                        if price_1h.is_some() || price_24h.is_some() {
+                            if let Some(mut item) = poll_state.get_mut(&symbol) {
+                                let generator = item.value_mut();
+                                let current = generator.current_price();
 
-                            // Update 1h if it exists
-                            if let Some(old) = price_1h {
-                                generator.change_1h = Some(((current - old) / old) * 100.0);
-                            }
+                                if let Some(old) = price_1h {
+                                    generator.change_1h = Some(((current - old) / old) * 100.0);
+                                }
 
-                            // Update 24h if it exists
-                            if let Some(old) = price_24h {
-                                generator.change_24h = Some(((current - old) / old) * 100.0);
+                                if let Some(old) = price_24h {
+                                    generator.change_24h = Some(((current - old) / old) * 100.0);
+                                }
                             }
                         }
                     }
@@ -149,13 +170,29 @@ async fn main() -> std::io::Result<()> {
             }
         }
     });
+
     info!("   ─────────────────────────────────────");
-    info!("   Symbols: SOL/USDC, BTC/USDC");
-    info!("   Tick rate: 100/sec (10ms)");
-    info!("   REST API: http://localhost:8080/api/v1/");
-    info!("   WebSocket: ws://localhost:8080/v1/feed");
+    for sym in &cfg.symbols {
+        info!("   Symbol: {}", sym.name);
+    }
+    info!("   Tick rate: {}/sec ({}ms)", nominal_tps, tick_interval_ms);
+    info!("   REST API:  http://localhost:{}/api/v1/", cfg.port);
+    info!("   WebSocket: ws://localhost:{}/v1/feed", cfg.port);
     info!("   ─────────────────────────────────────");
+
     let server_client = ch_client.clone();
+
+    // Token-bucket rate limiter per source IP
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(cfg.rate_limit_per_second)
+        .burst_size(cfg.rate_limit_burst)
+        .finish()
+        .expect("invalid rate limiter configuration");
+
+    let ws_cfg = web::Data::new(ws::WsConfig {
+        heartbeat_timeout_secs: cfg.ws_heartbeat_timeout_secs,
+        ping_interval_secs: cfg.ws_ping_interval_secs,
+    });
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
@@ -167,9 +204,11 @@ async fn main() -> std::io::Result<()> {
         let app_client = server_client.clone();
         App::new()
             .wrap(cors)
+            .wrap(Governor::new(&governor_conf))
             .app_data(web::Data::new(app_client.clone()))
             .app_data(state.clone())
             .app_data(broadcast_tx.clone())
+            .app_data(ws_cfg.clone())
             // REST endpoints
             .route("/api/v1/health", web::get().to(api::health))
             .route("/api/v1/symbols", web::get().to(api::symbols))
@@ -189,17 +228,18 @@ async fn main() -> std::io::Result<()> {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to listen for Ctrl+C");
-        info!("\n🛑 Ctrl+C detected! Starting graceful shutdown...");
+        info!("\nCtrl+C detected! Starting graceful shutdown...");
         shutdown_token.cancel();
         server_handle.stop(true).await;
-        drop(shutdown_tx)
+        drop(shutdown_tx);
     });
+
     server.await?;
     drop(db_tx);
 
-    info!("⏳ Waiting for database inserter to finish...");
+    info!("Waiting for database inserter to finish...");
     let _ = inserter_handle.await;
 
-    info!("🚀 Shutdown complete.");
+    info!("Shutdown complete.");
     Ok(())
 }

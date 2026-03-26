@@ -78,3 +78,29 @@ pub const FIXED_POINT_SCALE: u64 = 100_000_000;
 pub fn to_fixed_point(value: f64) -> u64 {
     (value * FIXED_POINT_SCALE as f64) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_fixed_point_whole_number() {
+        assert_eq!(to_fixed_point(1.0), 100_000_000);
+    }
+
+    #[test]
+    fn to_fixed_point_smallest_unit() {
+        // 1e-8 should map to exactly 1
+        assert_eq!(to_fixed_point(0.00000001), 1);
+    }
+
+    #[test]
+    fn to_fixed_point_large_price() {
+        assert_eq!(to_fixed_point(65_000.0), 6_500_000_000_000);
+    }
+
+    #[test]
+    fn to_fixed_point_zero() {
+        assert_eq!(to_fixed_point(0.0), 0);
+    }
+}
