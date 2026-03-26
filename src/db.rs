@@ -368,7 +368,74 @@ pub async fn poll_1h_change(client: &Client, symbol: &str) -> Option<f64> {
         .and_then(|row| row.price.to_f64())
 }
 
-pub async fn get_historical_ohlc(client: &Client, symbol: &str, minutes: usize) -> Vec<OhlcvBar> {
+pub async fn get_historical_ohlc(
+    client: &Client,
+    symbol: &str,
+    minutes: usize,
+    interval: &str,
+) -> Vec<OhlcvBar> {
+    // Validate interval and map to MV table + fallback truncation expression.
+    // The match also prevents SQL injection via the interval parameter.
+    let mv_info: Option<(&str, &str)> = match interval {
+        "5m"  => Some(("historical_trades_mv_5m",  "toStartOfInterval(timestamp, INTERVAL 5 MINUTE)")),
+        "15m" => Some(("historical_trades_mv_15m", "toStartOfInterval(timestamp, INTERVAL 15 MINUTE)")),
+        "1h"  => Some(("historical_trades_mv_1h",  "toStartOfHour(timestamp)")),
+        "1d"  => Some(("historical_trades_mv_1d",  "toStartOfDay(timestamp)")),
+        _     => None, // "1m" or unrecognised → use existing market_ohlc path
+    };
+
+    if let Some((mv_table, fallback_trunc)) = mv_info {
+        // Primary: query the AggregatingMergeTree materialized view.
+        // *Merge aggregate functions finalise the stored *State values.
+        let mv_query = format!(
+            "SELECT symbol, candle_time,
+                    argMinMerge(open)  AS open,
+                    maxMerge(high)     AS high,
+                    minMerge(low)      AS low,
+                    argMaxMerge(close) AS close,
+                    sumMerge(volume)   AS volume
+             FROM hft_dashboard.{}
+             WHERE symbol = ? AND candle_time >= (now() - interval {} minute)
+             GROUP BY symbol, candle_time
+             ORDER BY candle_time ASC",
+            mv_table, minutes
+        );
+
+        let rows = client.query(&mv_query).bind(symbol).fetch_all::<OhlcvRow>().await;
+        if let Ok(rows) = rows {
+            if !rows.is_empty() {
+                return rows.into_iter().map(|r| r.into()).collect();
+            }
+        }
+
+        // Fallback: on-the-fly aggregation from raw trades using correct interval truncation.
+        let fallback_query = format!(
+            "SELECT
+                symbol,
+                {} AS candle_time,
+                argMin(price, timestamp) AS open,
+                max(price)               AS high,
+                min(price)               AS low,
+                argMax(price, timestamp) AS close,
+                sum(amount)              AS volume
+             FROM hft_dashboard.historical_trades
+             WHERE symbol = ? AND timestamp >= (now() - interval {} minute)
+             GROUP BY symbol, candle_time
+             ORDER BY candle_time ASC",
+            fallback_trunc, minutes
+        );
+
+        return match client.query(&fallback_query).bind(symbol).fetch_all::<OhlcvRow>().await {
+            Ok(rows) => rows.into_iter().map(|r| r.into()).collect(),
+            Err(e) => {
+                error!("ClickHouse fallback aggregation failed for interval {}: {}", interval, e);
+                DB_ERROR_COUNTER.with_label_values(&["get_historical_ohlc"]).inc();
+                vec![]
+            }
+        };
+    }
+
+    // 1m path: read from the pre-aggregated market_ohlc table first.
     let ohlc_query = format!(
         "SELECT symbol, candle_time, open, high, low, close, volume
          FROM hft_dashboard.market_ohlc
@@ -384,7 +451,7 @@ pub async fn get_historical_ohlc(client: &Client, symbol: &str, minutes: usize) 
         }
     }
 
-    // Fallback: aggregate from raw trades
+    // 1m fallback: aggregate from raw trades at minute granularity.
     let trades_query = format!(
         "SELECT
             symbol,

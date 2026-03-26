@@ -70,10 +70,11 @@ pub async fn bbo(state: AppState, path: web::Path<String>) -> impl Responder {
     }
 }
 
-/// GET /api/v1/ohlcv/{symbol}?minutes=N
+/// GET /api/v1/ohlcv/{symbol}?minutes=N&interval=1m|5m|15m|1h|1d
 #[derive(serde::Deserialize)]
 pub struct OhlcvQuery {
     minutes: Option<usize>,
+    interval: Option<String>,
 }
 
 pub async fn ohlcv(
@@ -84,8 +85,9 @@ pub async fn ohlcv(
 ) -> impl Responder {
     let symbol = raw_symbol_to_symbol(path.into_inner());
     let minutes = query.minutes.unwrap_or(60).clamp(1, 10_080);
+    let interval = query.interval.as_deref().unwrap_or("1m");
 
-    let candles = crate::db::get_historical_ohlc(&client, &symbol, minutes).await;
+    let candles = crate::db::get_historical_ohlc(&client, &symbol, minutes, interval).await;
 
     if candles.is_empty() {
         return match state.get(&symbol) {
