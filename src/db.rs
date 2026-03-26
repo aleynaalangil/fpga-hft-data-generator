@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use prometheus::{
     opts, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
 };
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,6 +193,10 @@ pub struct OhlcvRow {
     pub close: Decimal,
     #[serde(with = "ch_decimal")]
     pub volume: Decimal,
+    #[serde(with = "ch_decimal")]
+    pub change_1h: Decimal,
+    #[serde(with = "ch_decimal")]
+    pub change_24h: Decimal,
 }
 
 impl From<&OhlcvBar> for OhlcvRow {
@@ -205,7 +209,21 @@ impl From<&OhlcvBar> for OhlcvRow {
             low: bar.low,
             close: bar.close,
             volume: bar.volume,
+            change_1h: Decimal::ZERO,
+            change_24h: Decimal::ZERO,
         }
+    }
+}
+
+impl OhlcvRow {
+    pub fn with_changes(mut self, change_1h: Option<f64>, change_24h: Option<f64>) -> Self {
+        if let Some(v) = change_1h {
+            self.change_1h = Decimal::from_f64(v).unwrap_or(Decimal::ZERO);
+        }
+        if let Some(v) = change_24h {
+            self.change_24h = Decimal::from_f64(v).unwrap_or(Decimal::ZERO);
+        }
+        self
     }
 }
 
@@ -346,32 +364,41 @@ async fn flush_ohlcv(
 // Historical queries
 // ---------------------------------------------------------------------------
 
+/// Single-column result for price lookups — avoids borrowing the full TradeRow struct.
+#[derive(clickhouse::Row, Deserialize)]
+struct PriceRow {
+    #[serde(with = "ch_decimal")]
+    val: Decimal,
+}
+
 pub async fn poll_24h_change(client: &Client, symbol: &str) -> Option<f64> {
+    // market_ohlc has a 90-day TTL — safe source for 24h-ago prices.
     client
         .query(
-            "SELECT price FROM hft_dashboard.historical_trades \
-             WHERE symbol = ? AND timestamp >= (now() - interval 1 day) \
-             ORDER BY timestamp ASC LIMIT 1",
+            "SELECT close AS val FROM hft_dashboard.market_ohlc FINAL \
+             WHERE symbol = ? AND candle_time <= (now() - interval 1 day) \
+             ORDER BY candle_time DESC LIMIT 1",
         )
         .bind(symbol)
-        .fetch_one::<TradeRow>()
+        .fetch_one::<PriceRow>()
         .await
         .ok()
-        .and_then(|row| row.price.to_f64())
+        .and_then(|row| row.val.to_f64())
 }
 
 pub async fn poll_1h_change(client: &Client, symbol: &str) -> Option<f64> {
+    // historical_trades has a 2h TTL — fine for looking back 1h.
     client
         .query(
-            "SELECT price FROM hft_dashboard.historical_trades \
-             WHERE symbol = ? AND timestamp >= (now() - interval 1 hour) \
-             ORDER BY timestamp ASC LIMIT 1",
+            "SELECT price AS val FROM hft_dashboard.historical_trades \
+             WHERE symbol = ? AND timestamp <= (now() - interval 1 hour) \
+             ORDER BY timestamp DESC LIMIT 1",
         )
         .bind(symbol)
-        .fetch_one::<TradeRow>()
+        .fetch_one::<PriceRow>()
         .await
         .ok()
-        .and_then(|row| row.price.to_f64())
+        .and_then(|row| row.val.to_f64())
 }
 
 pub async fn get_historical_ohlc(
@@ -399,7 +426,9 @@ pub async fn get_historical_ohlc(
                     maxMerge(high)     AS high,
                     minMerge(low)      AS low,
                     argMaxMerge(close) AS close,
-                    sumMerge(volume)   AS volume
+                    sumMerge(volume)   AS volume,
+                    toDecimal64(0, 8)  AS change_1h,
+                    toDecimal64(0, 8)  AS change_24h
              FROM hft_dashboard.{}
              WHERE symbol = ? AND candle_time >= (now() - interval {} minute)
              GROUP BY symbol, candle_time
@@ -423,7 +452,9 @@ pub async fn get_historical_ohlc(
                 max(price)               AS high,
                 min(price)               AS low,
                 argMax(price, timestamp) AS close,
-                sum(amount)              AS volume
+                sum(amount)              AS volume,
+                toDecimal64(0, 8)        AS change_1h,
+                toDecimal64(0, 8)        AS change_24h
              FROM hft_dashboard.historical_trades
              WHERE symbol = ? AND timestamp >= (now() - interval {} minute)
              GROUP BY symbol, candle_time
@@ -443,7 +474,7 @@ pub async fn get_historical_ohlc(
 
     // 1m path: read from the pre-aggregated market_ohlc table first.
     let ohlc_query = format!(
-        "SELECT symbol, candle_time, open, high, low, close, volume
+        "SELECT symbol, candle_time, open, high, low, close, volume, change_1h, change_24h
          FROM hft_dashboard.market_ohlc
          WHERE symbol = ? AND candle_time >= (now() - interval {} minute)
          ORDER BY candle_time ASC",
@@ -462,11 +493,13 @@ pub async fn get_historical_ohlc(
         "SELECT
             symbol,
             toStartOfMinute(timestamp) AS candle_time,
-            argMin(price, timestamp) AS open,
-            max(price)               AS high,
-            min(price)               AS low,
-            argMax(price, timestamp) AS close,
-            sum(amount)              AS volume
+            argMin(price, timestamp)   AS open,
+            max(price)                 AS high,
+            min(price)                 AS low,
+            argMax(price, timestamp)   AS close,
+            sum(amount)                AS volume,
+            toDecimal64(0, 8)          AS change_1h,
+            toDecimal64(0, 8)          AS change_24h
          FROM hft_dashboard.historical_trades
          WHERE symbol = ? AND timestamp >= (now() - interval {} minute)
          GROUP BY symbol, candle_time
@@ -489,12 +522,14 @@ pub async fn backfill_missing_candles(client: &Client) {
         "INSERT INTO hft_dashboard.market_ohlc
          SELECT
             symbol,
-            toStartOfMinute(timestamp) AS candle_time,
-            argMin(price, timestamp)   AS open,
-            max(price)                 AS high,
-            min(price)                 AS low,
-            argMax(price, timestamp)   AS close,
-            sum(amount)                AS volume
+            toStartOfMinute(timestamp)        AS candle_time,
+            argMin(price, timestamp)           AS open,
+            max(price)                         AS high,
+            min(price)                         AS low,
+            argMax(price, timestamp)           AS close,
+            sum(amount)                        AS volume,
+            toDecimal64(0, 8)                  AS change_1h,
+            toDecimal64(0, 8)                  AS change_24h
          FROM hft_dashboard.historical_trades
          WHERE timestamp >= now() - INTERVAL 2 HOUR
              AND toStartOfMinute(timestamp) NOT IN (

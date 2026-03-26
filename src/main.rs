@@ -149,8 +149,9 @@ async fn main() -> std::io::Result<()> {
                         }
 
                         if let Some(bar) = generator.check_candle_closure() {
-                            let _ = bg_db_tx
-                                .try_send(db::InserterPayload::Ohlcv(OhlcvRow::from(&bar)));
+                            let row = OhlcvRow::from(&bar)
+                                .with_changes(generator.change_1h, generator.change_24h);
+                            let _ = bg_db_tx.try_send(db::InserterPayload::Ohlcv(row));
                         }
                     }
                 }

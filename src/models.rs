@@ -63,7 +63,9 @@ pub struct MarketDataMessage {
     pub price: f64,
     pub volume: f64,
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub change_1h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub change_24h: Option<f64>,
     pub bbo: Option<BboSnapshot>,
     pub tick: Option<MarketTick>,

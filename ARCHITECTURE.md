@@ -160,9 +160,16 @@ rounding drift across aggregations.
 
 **`OhlcvBar`** — 1-minute candle with open/high/low/close/volume, all `Decimal`.
 
+**`OhlcvRow`** — ClickHouse wire type for `market_ohlc`. Extends `OhlcvBar` with
+`change_1h` and `change_24h` (`Decimal64(8)`). At candle close, the generator's
+live change percentages are stamped onto the row via `OhlcvRow::with_changes()`.
+
 **`MarketDataMessage`** — the WebSocket envelope. Bundles tick, BBO, current
 candle, telemetry, and change percentages into one JSON payload. Uses `f64` for
-JSON compatibility (JavaScript has no native Decimal type).
+JSON compatibility (JavaScript has no native Decimal type). `change_1h` and
+`change_24h` carry `#[serde(skip_serializing_if = "Option::is_none")]` — they are
+absent from the JSON entirely when the generator has no polled value yet, so the
+frontend never receives a spurious `null` that would overwrite a cached value.
 
 **`SystemTelemetry`** — real measured latency (`actual_latency_ms` from the tick
 loop) and nominal TPS derived from `tick_interval_ms`. The `error_rate` field is
@@ -245,8 +252,8 @@ instrumented with `DB_FLUSH_DURATION` timers and increment `DB_ERROR_COUNTER` on
 failure. Buffer sizes and flush intervals come from `AppConfig`.
 
 **Historical queries:**
-- `poll_1h_change` / `poll_24h_change` — oldest price in the last 1h / 24h from
-  `historical_trades`. Returns `None` if no data yet.
+- `poll_1h_change` — price at/before 1h ago from `historical_trades` (`ORDER BY timestamp DESC LIMIT 1` on rows `<= now() - 1h`). Uses a local single-field `PriceRow` struct to avoid deserialising the full `TradeRow`. Returns `None` if no data older than 1h exists yet. `historical_trades` has a 2h TTL so 1h lookback is safe.
+- `poll_24h_change` — price at/before 24h ago from `market_ohlc FINAL` (`close` column, `ORDER BY candle_time DESC LIMIT 1` on rows `<= now() - 1 day`). Uses `market_ohlc` (90-day TTL) because `historical_trades` only retains 2h of data. Returns `None` until 24h of candle history exists.
 - `get_historical_ohlc(client, symbol, minutes, interval)` — routes to the correct
   ClickHouse data source based on `interval`:
   - `1m` → `market_ohlc` (pre-aggregated 1m candles) → fallback: `toStartOfMinute` GROUP BY on raw trades
@@ -375,8 +382,7 @@ shutdown intent to all tasks cleanly. The inserter is additionally signalled by
 channel closure and drains its buffer before exiting.
 
 **Layered fallbacks** — OHLCV endpoint: ClickHouse → in-memory ring buffer.
-Change poller: real DB value → `None` (zero displayed). Prioritises availability
-over strict accuracy.
+Change poller: real DB value → `None` (field omitted from WS message, frontend shows `—`). Prioritises availability over strict accuracy.
 
 **Fixed-point arithmetic for prices** — `rust_decimal::Decimal` for business logic,
 `u64` fixed-point (scale 10^8) for the order book. Avoids floating-point rounding
@@ -850,7 +856,8 @@ ORDER BY (user_id, symbol)
 | Tick INSERT (batched) | fpga-hft-data-generator | `hft_dashboard.historical_trades` | Buffered, flush every 1s or 1000 rows |
 | Candle INSERT | fpga-hft-data-generator | `hft_dashboard.market_ohlc` | On minute boundary, per symbol |
 | MV population | ClickHouse (automatic) | `historical_trades_mv_*` | Triggered by every INSERT to `historical_trades` |
-| 1h/24h change poll | fpga-hft-data-generator | `hft_dashboard.historical_trades` | `SELECT price ... ORDER BY timestamp ASC LIMIT 1` every 5s |
+| 1h change poll | fpga-hft-data-generator | `hft_dashboard.historical_trades` | `SELECT price ... WHERE timestamp <= now()-1h ORDER BY timestamp DESC LIMIT 1` every 5s |
+| 24h change poll | fpga-hft-data-generator | `hft_dashboard.market_ohlc FINAL` | `SELECT close ... WHERE candle_time <= now()-1d ORDER BY candle_time DESC LIMIT 1` every 5s |
 | OHLCV read | fpga-hft-data-generator | `hft_dashboard.market_ohlc` / MVs | On `GET /api/v1/ohlcv/{symbol}?interval=` |
 | Candle backfill | fpga-hft-data-generator | `hft_dashboard.market_ohlc` | INSERT...SELECT on startup |
 | User register | exchange-sim | `exchange.users` | INSERT new row |
