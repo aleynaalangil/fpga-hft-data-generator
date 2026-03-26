@@ -221,16 +221,15 @@ impl MarketGenerator {
 
     /// Build a WebSocket message.
     /// `actual_latency_ms` is the measured tick generation time in milliseconds.
-    /// `actual_tps` is the nominal throughput derived from the configured tick interval.
-    pub fn to_ws_message(&self, actual_latency_ms: f64, actual_tps: u32) -> MarketDataMessage {
+    /// `actual_tps` is the measured throughput in ticks per second.
+    /// `actual_error_rate` is the measured percentage of failed DB operations (0.0 to 1.0).
+    pub fn to_ws_message(&self, actual_latency_ms: f64, actual_tps: u32, actual_error_rate: f64) -> MarketDataMessage {
         let latest = self.latest_tick();
 
         let telemetry = SystemTelemetry {
             latency: actual_latency_ms,
             throughput_tps: actual_tps,
-            // error_rate is tracked via the hft_db_errors_total Prometheus counter;
-            // it is not re-derived here to avoid coupling the hot tick path to metrics reads.
-            error_rate: 0.0,
+            error_rate: actual_error_rate,
         };
 
         let ohlc = self.current_candle.clone();

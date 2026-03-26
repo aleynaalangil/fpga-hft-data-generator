@@ -7,6 +7,7 @@ use prometheus::{
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 use tracing::{error, info};
@@ -16,6 +17,8 @@ pub enum InserterPayload {
     Ohlcv(OhlcvRow),
     Flush,
 }
+
+pub static DB_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -267,6 +270,7 @@ pub async fn run_unified_lazy_inserter(
                     if let Err(e) = flush_trades(&client, &mut trade_buffer).await {
                         error!("Failed to flush trades: {}", e);
                         DB_ERROR_COUNTER.with_label_values(&["flush_trades"]).inc();
+                        DB_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -278,6 +282,7 @@ pub async fn run_unified_lazy_inserter(
                         DB_ERROR_COUNTER
                             .with_label_values(&["flush_trades_interval"])
                             .inc();
+                        DB_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 if !ohlcv_buffer.is_empty() {
@@ -286,6 +291,7 @@ pub async fn run_unified_lazy_inserter(
                         DB_ERROR_COUNTER
                             .with_label_values(&["flush_ohlcv_interval"])
                             .inc();
+                        DB_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

@@ -13,7 +13,8 @@ use actix_web::{App, HttpServer, web};
 use dashmap::DashMap;
 use generator::MarketGenerator;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::join;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +88,13 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_millis(tick_interval_ms));
+        
+        let mut ticks_in_window = 0u64;
+        let mut last_error_count = 0u64;
+        let mut last_metrics_update = Instant::now();
+        let mut actual_tps = nominal_tps;
+        let mut actual_error_rate = 0.0f64;
+
         loop {
             tokio::select! {
                 _ = tick_token.cancelled() => {
@@ -95,6 +103,30 @@ async fn main() -> std::io::Result<()> {
                 }
                 _ = interval.tick() => {
                     db::TICK_COUNTER.inc();
+                    ticks_in_window += 1;
+
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_metrics_update);
+                    
+                    if elapsed >= Duration::from_secs(1) {
+                        let elapsed_secs = elapsed.as_secs_f64();
+                        // Throughput: total ticks generated per second across all symbols
+                        actual_tps = (ticks_in_window as f64 / elapsed_secs) as u32;
+                        
+                        let current_errors = db::DB_ERRORS.load(Ordering::Relaxed);
+                        let errors_in_window = current_errors.saturating_sub(last_error_count);
+                        
+                        // Error rate: failed operations / total operations in this window
+                        actual_error_rate = if ticks_in_window > 0 {
+                            (errors_in_window as f64 / ticks_in_window as f64).min(1.0)
+                        } else {
+                            0.0
+                        };
+
+                        ticks_in_window = 0;
+                        last_error_count = current_errors;
+                        last_metrics_update = now;
+                    }
 
                     for mut item in bg_state.iter_mut() {
                         let tick_start = Instant::now();
@@ -111,7 +143,7 @@ async fn main() -> std::io::Result<()> {
 
                         let _ = bg_db_tx.try_send(db::InserterPayload::Trade(TradeRow::from(&tick)));
 
-                        let ws_msg = generator.to_ws_message(tick_latency_ms, nominal_tps);
+                        let ws_msg = generator.to_ws_message(tick_latency_ms, actual_tps, actual_error_rate);
                         if let Ok(json) = serde_json::to_string(&ws_msg) {
                             let _ = bg_broadcast_tx.send(json);
                         }
